@@ -50,6 +50,9 @@
       <button id="btn-scan" class="btn btn-primary btn-full">
         Scan Library
       </button>
+      <button id="btn-resume-scan" class="btn btn-warning btn-full hidden">
+        Resume Scan
+      </button>
       <button id="btn-refresh-token-2" class="btn btn-ghost btn-full">
         Refresh Token
       </button>
@@ -82,6 +85,10 @@
       </div>
     </div>
 
+    <div id="scan-incomplete-notice" class="scan-incomplete hidden">
+      ⚠ Incomplete scan — <button id="btn-resume-scan-2" class="btn-inline-link">Resume from page <span id="resume-page-num">?</span></button>
+    </div>
+
     <div class="search-row">
       <input type="text" id="search-input" class="search-input" placeholder="Filter songs…" />
     </div>
@@ -91,6 +98,9 @@
     <div class="download-actions">
       <button id="btn-download-selected" class="btn btn-primary btn-full">
         Download Selected MP3s
+      </button>
+      <button id="btn-test-download" class="btn btn-ghost btn-full mt-4" disabled>
+        Test Download (1 Song)
       </button>
       <button id="btn-export-csv" class="btn btn-ghost btn-full mt-4">
         Export Library as CSV

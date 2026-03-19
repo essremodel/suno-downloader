@@ -52,7 +52,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case 'scanLibrary':
-      scanLibrary(sendResponse);
+      scanLibrary(sendResponse, msg.resumeFromPage || 0);
       return true;
 
     case 'cancelScan':
@@ -69,7 +69,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return true;
 
     case 'clearLibrary':
-      chrome.storage.local.remove(['library', 'downloaded'], () => sendResponse({ ok: true }));
+      chrome.storage.local.remove(['library', 'downloaded', 'scanComplete', 'scanPage'], () => sendResponse({ ok: true }));
       return true;
 
     default:
@@ -197,28 +197,66 @@ async function refreshTokenViaCookie() {
 
 // ── Suno API fetch helper ─────────────────────────────────────────────────────
 
-async function sunoApiFetch(path, token) {
+// options: { signal, maxRetries, onRateLimit(waitSecs) }
+async function sunoApiFetch(path, token, { signal, maxRetries = 5, onRateLimit } = {}) {
   const url = `${activeApiBase}${path}`;
   console.log(`[BG] API fetch: ${url}`);
 
-  const resp = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Accept': 'application/json',
-      'Content-Type': 'application/json',
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      'Origin': 'https://suno.com',
-      'Referer': 'https://suno.com/',
-    },
-  });
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    let resp;
+    try {
+      resp = await fetch(url, {
+        signal,
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json',
+          'Content-Type': 'application/json',
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Origin': 'https://suno.com',
+          'Referer': 'https://suno.com/',
+        },
+      });
+    } catch (e) {
+      if (e.name === 'AbortError') throw e;
+      if (attempt === maxRetries) throw e;
+      await sleep(2000 * attempt);
+      continue;
+    }
 
-  if (!resp.ok) {
+    if (resp.ok) return resp.json();
+
+    if (resp.status === 429) {
+      if (attempt === maxRetries) {
+        throw new Error(`HTTP 429: Rate limited after ${maxRetries} attempts`);
+      }
+      // Respect Retry-After header if present, otherwise exponential backoff:
+      // attempt 1→10s, 2→30s, 3→60s, 4→120s cap at 240s
+      const retryAfter = resp.headers.get('Retry-After');
+      let waitMs;
+      if (retryAfter && !isNaN(retryAfter)) {
+        waitMs = parseInt(retryAfter) * 1000 + 1000;
+      } else {
+        waitMs = Math.min(10_000 * Math.pow(3, attempt - 1), 240_000);
+      }
+      const waitSecs = Math.round(waitMs / 1000);
+      console.log(`[BG] Rate limited (429). Waiting ${waitSecs}s (attempt ${attempt}/${maxRetries})…`);
+      if (onRateLimit) onRateLimit(waitSecs);
+      await sleep(waitMs);
+      continue;
+    }
+
+    // 5xx: shorter backoff, give up after maxRetries
+    if (resp.status >= 500 && attempt < maxRetries) {
+      const waitMs = 2000 * Math.pow(2, attempt - 1);
+      console.warn(`[BG] HTTP ${resp.status}, retrying in ${waitMs}ms`);
+      await sleep(waitMs);
+      continue;
+    }
+
     const text = await resp.text().catch(() => '');
     throw new Error(`HTTP ${resp.status}: ${text.substring(0, 200)}`);
   }
-
-  return resp.json();
 }
 
 async function findWorkingApiBase(token) {
@@ -251,94 +289,99 @@ async function findWorkingApiBase(token) {
 // ── Status ────────────────────────────────────────────────────────────────────
 
 async function getStatus() {
-  const stored = await chrome.storage.local.get(['library', 'downloaded', 'cachedToken', 'tokenExpiry', 'username', 'apiBase']);
+  const stored = await chrome.storage.local.get(['library', 'downloaded', 'cachedToken', 'tokenExpiry', 'username', 'apiBase', 'scanComplete', 'scanPage']);
   const hasToken = !!(stored.cachedToken && Date.now() < (stored.tokenExpiry || 0));
 
-  // Restore the last-known working API base
   if (stored.apiBase) activeApiBase = stored.apiBase;
-
-  const username = stored.username || null;
 
   return {
     connected: hasToken,
-    username,
+    username: stored.username || null,
     apiBase: activeApiBase,
     libraryCount: (stored.library || []).length,
     downloadedCount: Object.keys(stored.downloaded || {}).length,
     downloadActive,
+    scanComplete: stored.scanComplete !== false,  // true if never run or finished
+    scanPage: stored.scanPage || 0,
   };
 }
 
 // ── Library Scanning ──────────────────────────────────────────────────────────
 
-async function scanLibrary(sendResponse) {
+async function scanLibrary(sendResponse, startPage = 0) {
   if (scanAbortController) scanAbortController.abort();
   scanAbortController = new AbortController();
   const signal = scanAbortController.signal;
 
-  const allClips = [];
-  let page = 0;
-  const PAGE_SIZE = 20; // Suno's default
+  const PAGE_SIZE = 20;
+  const PAGE_DELAY_MS = 1500; // 1.5s between pages to stay well under rate limit
+  let page = startPage;
+
+  // Load pre-existing songs when resuming
+  let allClips = [];
+  if (startPage > 0) {
+    const stored = await chrome.storage.local.get(['library']);
+    allClips = stored.library || [];
+    console.log(`[BG] Resuming from page ${startPage} with ${allClips.length} existing songs`);
+  }
+
+  let domainVerified = startPage > 0; // skip domain probe when resuming
+
+  const onRateLimit = (waitSecs) =>
+    sendProgress('scan', { page, found: allClips.length, status: 'ratelimit', waitSecs });
 
   try {
-    sendProgress('scan', { page: 0, found: 0, status: 'starting' });
-
-    // On the very first page, probe for the working API domain if needed
-    let domainVerified = false;
+    sendProgress('scan', { page, found: allClips.length, status: startPage > 0 ? 'resuming' : 'starting' });
 
     while (!signal.aborted) {
       const token = await getValidToken();
 
-      console.log(`[BG] Scanning page ${page} via ${activeApiBase}...`);
+      console.log(`[BG] Scanning page ${page} via ${activeApiBase}…`);
       sendProgress('scan', { page, found: allClips.length, status: 'scanning' });
 
       let data;
       try {
         if (!domainVerified) {
-          // First call — if it fails with 503 try fallback domains before giving up
           try {
-            data = await sunoApiFetch(`/api/feed/v2?page=${page}`, token);
+            data = await sunoApiFetch(`/api/feed/v2?page=${page}`, token, { signal, onRateLimit });
             domainVerified = true;
           } catch (e) {
             if (e.message.includes('503') || e.message.includes('502')) {
-              console.warn(`[BG] ${activeApiBase} returned ${e.message} — trying fallback domains`);
+              console.warn(`[BG] ${activeApiBase} → ${e.message} — trying fallback domains`);
               await findWorkingApiBase(token);
-              data = await sunoApiFetch(`/api/feed/v2?page=${page}`, token);
+              data = await sunoApiFetch(`/api/feed/v2?page=${page}`, token, { signal, onRateLimit });
               domainVerified = true;
             } else {
               throw e;
             }
           }
         } else {
-          data = await sunoApiFetch(`/api/feed/v2?page=${page}`, token);
+          data = await sunoApiFetch(`/api/feed/v2?page=${page}`, token, { signal, onRateLimit });
         }
       } catch (e) {
         if (e.name === 'AbortError') break;
         throw e;
       }
 
-      // API returns either { clips: [...] } or just an array
-      const clips = Array.isArray(data) ? data : (data.clips || data.data || []);
+      const clips = Array.isArray(data) ? data : (data.clips || data.songs || data.data || []);
 
       if (!clips || clips.length === 0) {
         console.log('[BG] Scan complete — no more pages');
         break;
       }
 
-      // Filter out non-complete clips (uploading, error, etc.)
       const valid = clips.filter(c => c.id && (c.status === 'complete' || c.audio_url));
       allClips.push(...valid);
 
-      console.log(`[BG] Page ${page}: got ${clips.length} clips (${valid.length} valid), total: ${allClips.length}`);
+      console.log(`[BG] Page ${page}: ${clips.length} clips (${valid.length} valid), total: ${allClips.length}`);
 
-      if (clips.length < PAGE_SIZE) {
-        // Last page
-        break;
-      }
+      // Save incrementally after every page so a later failure doesn't lose everything
+      await chrome.storage.local.set({ library: allClips, scanComplete: false, scanPage: page });
+
+      if (clips.length < PAGE_SIZE) break; // last page
 
       page++;
-      // Rate-limit: 500ms between pages
-      await sleep(500);
+      await sleep(PAGE_DELAY_MS);
     }
 
     if (signal.aborted) {
@@ -347,8 +390,7 @@ async function scanLibrary(sendResponse) {
       return;
     }
 
-    // Persist library
-    await chrome.storage.local.set({ library: allClips });
+    await chrome.storage.local.set({ library: allClips, scanComplete: true, scanPage: page });
     console.log(`[BG] Library saved: ${allClips.length} songs`);
 
     sendProgress('scan', { status: 'complete', found: allClips.length });
@@ -356,8 +398,17 @@ async function scanLibrary(sendResponse) {
 
   } catch (e) {
     console.error('[BG] Scan error:', e);
-    sendProgress('scan', { status: 'error', error: e.message });
-    sendResponse({ error: e.message });
+
+    if (allClips.length > 0) {
+      // Preserve the songs we already have — never throw them away
+      await chrome.storage.local.set({ library: allClips, scanComplete: false, scanPage: page });
+      console.log(`[BG] Partial scan saved: ${allClips.length} songs through page ${page}`);
+      sendProgress('scan', { status: 'partial', found: allClips.length, page, error: e.message });
+      sendResponse({ partial: true, count: allClips.length, page, error: e.message });
+    } else {
+      sendProgress('scan', { status: 'error', error: e.message });
+      sendResponse({ error: e.message });
+    }
   }
 }
 
