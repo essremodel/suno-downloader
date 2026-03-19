@@ -56,9 +56,16 @@ function applyStatus(status) {
 
   $('username-display').textContent = status.username || 'essremodel';
 
+  // Show resume button if a partial scan exists
+  const hasPartial = status.libraryCount > 0 && !status.scanComplete;
+  $('btn-resume-scan').classList.toggle('hidden', !hasPartial);
+  if (hasPartial) {
+    $('btn-resume-scan').textContent = `Resume Scan (${status.libraryCount} found so far)`;
+  }
+
   if (status.libraryCount > 0) {
-    $('library-count-display').textContent = `${status.libraryCount} songs`;
-    // Load library data
+    $('library-count-display').textContent =
+      `${status.libraryCount} songs${!status.scanComplete ? ' (incomplete)' : ''}`;
     loadLibraryFromStorage();
   } else {
     $('library-count-display').textContent = 'Not scanned yet';
@@ -87,8 +94,10 @@ function bindButtons() {
   $('btn-refresh-token').addEventListener('click', handleRefreshToken);
   $('btn-refresh-token-2').addEventListener('click', handleRefreshToken);
 
-  // Scan
+  // Scan / resume
   $('btn-scan').addEventListener('click', handleScan);
+  $('btn-resume-scan').addEventListener('click', handleResumeScan);
+  $('btn-resume-scan-2').addEventListener('click', handleResumeScan);
   $('btn-cancel-scan').addEventListener('click', handleCancelScan);
   $('btn-rescan').addEventListener('click', handleScan);
 
@@ -109,6 +118,7 @@ function bindButtons() {
 
   // Download
   $('btn-download-selected').addEventListener('click', handleDownload);
+  $('btn-test-download').addEventListener('click', handleTestDownload);
 
   // CSV export
   $('btn-export-csv').addEventListener('click', handleExportCSV);
@@ -138,17 +148,40 @@ async function handleScan() {
   $('scan-count').textContent = 'Found 0 songs';
   setStatus('Scanning your library…');
   log('Starting library scan…', 'info');
+  await runScan(0);
+}
 
+async function handleResumeScan() {
+  const stored = await new Promise(r => chrome.storage.local.get(['scanPage'], r));
+  const resumePage = (stored.scanPage || 0) + 1;
+  showPanel('scanning');
+  $('scan-status-text').textContent = `Resuming from page ${resumePage}…`;
+  $('scan-count').textContent = 'Loading saved songs…';
+  setStatus(`Resuming scan from page ${resumePage}…`);
+  log(`Resuming scan from page ${resumePage}…`, 'info');
+  await runScan(resumePage);
+}
+
+async function runScan(startPage) {
   try {
-    const result = await bg('scanLibrary');
+    const result = await bg('scanLibrary', { resumeFromPage: startPage });
     if (result.error) throw new Error(result.error);
+
     if (result.cancelled) {
-      log(`Scan cancelled after finding ${result.count} songs`, 'info');
-      setStatus(`Scan cancelled. Found ${result.count} songs.`);
-      await loadStatus();
+      log(`Scan cancelled. ${result.count} songs saved.`, 'info');
+      setStatus(`Scan cancelled. ${result.count} songs saved.`);
+      await loadLibraryFromStorage();
       return;
     }
-    log(`Scan complete: ${result.count} songs found`, 'success');
+
+    if (result.partial) {
+      log(`Scan paused at page ${result.page}: ${result.count} songs saved. Error: ${result.error}`, 'error');
+      setStatus(`Saved ${result.count} songs (scan incomplete — hit a limit at page ${result.page})`);
+      await loadLibraryFromStorage();
+      return;
+    }
+
+    log(`Scan complete: ${result.count} songs`, 'success');
     setStatus(`Found ${result.count} songs.`);
     await loadLibraryFromStorage();
   } catch (e) {
@@ -163,21 +196,56 @@ function handleCancelScan() {
   setStatus('Cancelling scan…');
 }
 
+async function handleTestDownload() {
+  if (allSongs.length === 0) {
+    log('No songs loaded — scan your library first.', 'error');
+    return;
+  }
+  const clip = allSongs[0];
+  log(`Test download: "${clip.title || clip.id}"…`, 'info');
+  setStatus(`Test downloading: ${clip.title || clip.id}`);
+
+  try {
+    const result = await bg('startDownloads', { clipIds: [clip.id] });
+    if (result.error) throw new Error(result.error);
+    // Progress will arrive via the normal download progress listener
+  } catch (e) {
+    log('Test download failed: ' + e.message, 'error');
+    setStatus('Test download failed: ' + e.message);
+  }
+}
+
 // ── Library ───────────────────────────────────────────────────────────────────
 async function loadLibraryFromStorage() {
   const { library } = await bgRaw('getLibrary');
-  const { downloaded = {} } = await new Promise(r => chrome.storage.local.get(['downloaded'], r));
+  const stored = await new Promise(r =>
+    chrome.storage.local.get(['downloaded', 'scanComplete', 'scanPage'], r)
+  );
 
   allSongs = library || [];
-  downloadedIds = new Set(Object.keys(downloaded));
+  downloadedIds = new Set(Object.keys(stored.downloaded || {}));
 
   // Select all by default
   selectedIds = new Set(allSongs.map(c => c.id));
 
   filteredSongs = [...allSongs];
+
+  // Show/hide partial scan notice
+  const isIncomplete = stored.scanComplete === false && allSongs.length > 0;
+  const notice = $('scan-incomplete-notice');
+  notice.classList.toggle('hidden', !isIncomplete);
+  if (isIncomplete) {
+    $('resume-page-num').textContent = (stored.scanPage || 0) + 1;
+  }
+
+  // Enable test download button when library has songs
+  $('btn-test-download').disabled = allSongs.length === 0;
+
   renderLibraryPanel();
   showPanel('library');
-  setStatus(`Library: ${allSongs.length} songs (${downloadedIds.size} already downloaded)`);
+  setStatus(
+    `Library: ${allSongs.length} songs${isIncomplete ? ' (incomplete — resume to get more)' : ''} · ${downloadedIds.size} already downloaded`
+  );
 }
 
 function renderLibraryPanel() {
@@ -379,9 +447,15 @@ function listenToBackground() {
 function handleScanProgress(msg) {
   if (currentPanel !== 'scanning') return;
 
-  if (msg.status === 'scanning') {
+  if (msg.status === 'scanning' || msg.status === 'resuming') {
     $('scan-status-text').textContent = `Scanning page ${msg.page}…`;
     $('scan-count').textContent = `Found ${msg.found} songs`;
+  } else if (msg.status === 'ratelimit') {
+    $('scan-status-text').textContent = `Rate limited — waiting ${msg.waitSecs}s…`;
+    $('scan-count').textContent = `${msg.found} songs saved so far`;
+  } else if (msg.status === 'partial') {
+    $('scan-status-text').textContent = `Paused at page ${msg.page}`;
+    $('scan-count').textContent = `${msg.found} songs saved`;
   } else if (msg.status === 'complete') {
     $('scan-status-text').textContent = 'Scan complete!';
     $('scan-count').textContent = `Found ${msg.found} songs`;

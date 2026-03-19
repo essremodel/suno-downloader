@@ -133,6 +133,25 @@ header {
 }
 .btn-tiny:hover:not(:disabled) { color: var(--text); }
 
+.btn-warning {
+  background: #78350f;
+  color: #fcd34d;
+  border: 1px solid #92400e;
+}
+.btn-warning:hover:not(:disabled) { background: #92400e; }
+
+.btn-inline-link {
+  background: none;
+  border: none;
+  color: #fcd34d;
+  font-size: inherit;
+  font-family: var(--font);
+  cursor: pointer;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 .btn-full { width: 100%; }
 
 .btn-group { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
@@ -176,6 +195,20 @@ header {
 .total-count    { font-size: 13px; font-weight: 600; }
 .selected-count { font-size: 11px; color: var(--text-muted); }
 .library-actions { display: flex; gap: 4px; }
+
+/* ── Partial scan notice ─────────────────────────────────────────────────── */
+.scan-incomplete {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  background: #1c1408;
+  border: 1px solid #92400e;
+  border-radius: var(--radius);
+  font-size: 11.5px;
+  color: #fcd34d;
+}
 
 .search-row { margin-bottom: 8px; }
 .search-input {
