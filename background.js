@@ -10,6 +10,8 @@
 
 'use strict';
 
+import { createTaggedMp3 } from './id3-writer.js';
+
 // ── API config ────────────────────────────────────────────────────────────────
 // Primary domain confirmed via Suno's security disclosure + open-source projects.
 // The legacy .suno.ai domain returns 503. Auto-discovery overrides both at runtime
@@ -442,7 +444,7 @@ async function startDownloads(clipIds, sendResponse) {
   sendProgress('download', { completed, failed, total, status: 'starting' });
 
   try {
-    await downloadQueue(clips, 3, async (clip, success, error) => {
+    await downloadQueue(clips, 2, async (clip, success, error) => {
       if (success) {
         completed++;
         downloaded[clip.id] = { title: clip.title, downloadedAt: Date.now() };
@@ -470,20 +472,14 @@ async function downloadQueue(clips, maxConcurrent, onResult) {
   async function next() {
     while (index < clips.length) {
       const clip = clips[index++];
-      const url = clip.audio_url || `https://cdn1.suno.ai/${clip.id}.mp3`;
-      const filename = `Suno Downloads/${sanitizeFilename(clip.title || 'Untitled', clip.id)}`;
-
-      console.log(`[BG] Downloading: ${clip.title} → ${filename}`);
-
       try {
-        await downloadFile(url, filename);
+        await downloadSongWithMetadata(clip);
         await onResult(clip, true, null);
       } catch (e) {
         await onResult(clip, false, e.message);
       }
-
-      // Small delay between downloads to be polite
-      await sleep(200);
+      // 1s between downloads — MP3 + art are in memory during this gap, let GC breathe
+      await sleep(1000);
     }
   }
 
@@ -491,24 +487,80 @@ async function downloadQueue(clips, maxConcurrent, onResult) {
   await Promise.all(workers);
 }
 
-function downloadFile(url, filename) {
+// ── Metadata-embedded download ────────────────────────────────────────────────
+
+async function downloadSongWithMetadata(clip) {
+  const title  = clip.title || 'Untitled';
+  const songId = clip.id;
+  console.log(`[BG] Fetching MP3 + art: "${title}"`);
+
+  // 1. Fetch the raw MP3
+  const audioUrl = clip.audio_url || `https://cdn1.suno.ai/${songId}.mp3`;
+  const mp3Resp  = await fetch(audioUrl);
+  if (!mp3Resp.ok) throw new Error(`MP3 fetch failed: HTTP ${mp3Resp.status}`);
+  const mp3Data  = await mp3Resp.arrayBuffer();
+
+  // 2. Fetch cover art — try image_large_url → image_url → constructed URL
+  let coverArt      = null;
+  let coverMimeType = 'image/jpeg';
+  const imageUrls   = [
+    clip.image_large_url,
+    clip.image_url,
+    `https://cdn2.suno.ai/image_${songId}.jpeg`,
+  ].filter(Boolean);
+
+  for (const imgUrl of imageUrls) {
+    try {
+      const imgResp = await fetch(imgUrl);
+      if (imgResp.ok) {
+        coverArt      = await imgResp.arrayBuffer();
+        coverMimeType = imgResp.headers.get('content-type')?.split(';')[0] || 'image/jpeg';
+        console.log(`[BG] Cover art: ${Math.round(coverArt.byteLength / 1024)}KB from ${imgUrl}`);
+        break;
+      }
+    } catch { /* try next URL */ }
+  }
+  if (!coverArt) console.log('[BG] No cover art found — embedding without APIC frame');
+
+  // 3. Assemble metadata
+  const tags = (clip.metadata?.tags || '')
+    .split(',').map(t => t.trim()).filter(Boolean);
+  const meta = {
+    title,
+    artist:        clip.display_name || 'Suno AI',
+    album:         `Suno - ${clip.display_name || 'AI Music'}`,
+    genre:         tags[0] || '',
+    year:          clip.created_at ? String(new Date(clip.created_at).getFullYear()) : '',
+    comment:       `Suno ID: ${songId}`,
+    lyrics:        clip.metadata?.prompt || '',
+    coverArt,
+    coverMimeType,
+  };
+
+  // 4. Embed ID3 tags and wrap in a Blob
+  const taggedBlob = createTaggedMp3(mp3Data, meta);
+  const blobUrl    = URL.createObjectURL(taggedBlob);
+  const filename   = `Suno Downloads/${sanitizeFilename(title, songId)}`;
+
+  // 5. Hand off to chrome.downloads — revoke the blob URL after completion
   return new Promise((resolve, reject) => {
     chrome.downloads.download(
-      { url, filename, conflictAction: 'uniquify', saveAs: false },
+      { url: blobUrl, filename, conflictAction: 'uniquify', saveAs: false },
       (downloadId) => {
         if (chrome.runtime.lastError) {
+          URL.revokeObjectURL(blobUrl);
           reject(new Error(chrome.runtime.lastError.message));
           return;
         }
 
-        // Wait for download to complete
         const listener = (delta) => {
           if (delta.id !== downloadId) return;
-
           if (delta.state?.current === 'complete') {
+            URL.revokeObjectURL(blobUrl);
             chrome.downloads.onChanged.removeListener(listener);
             resolve(downloadId);
           } else if (delta.state?.current === 'interrupted') {
+            URL.revokeObjectURL(blobUrl);
             chrome.downloads.onChanged.removeListener(listener);
             reject(new Error(`Download interrupted: ${delta.error?.current || 'unknown'}`));
           }
@@ -516,10 +568,11 @@ function downloadFile(url, filename) {
 
         chrome.downloads.onChanged.addListener(listener);
 
-        // Timeout guard: 5 minutes per file
+        // Timeout guard (5 min) — revoke blob so it doesn't linger
         setTimeout(() => {
+          URL.revokeObjectURL(blobUrl);
           chrome.downloads.onChanged.removeListener(listener);
-          resolve(downloadId); // Don't reject on timeout — it may still be downloading
+          resolve(downloadId);
         }, 300_000);
       }
     );
