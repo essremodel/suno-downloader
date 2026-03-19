@@ -10,9 +10,21 @@
 
 'use strict';
 
+// ── API config ────────────────────────────────────────────────────────────────
+// Primary domain confirmed via Suno's security disclosure + open-source projects.
+// The legacy .suno.ai domain returns 503. Auto-discovery overrides both at runtime
+// by reading the actual domain from intercepted page requests.
+const API_DOMAINS = [
+  'https://studio-api.prod.suno.com',
+  'https://studio-api.suno.ai',        // legacy fallback
+];
+let activeApiBase = API_DOMAINS[0];    // updated by auto-discovery
+
 // ── State ─────────────────────────────────────────────────────────────────────
 let currentToken = null;
-let tokenExpiry = 0;         // ms timestamp
+let tokenExpiry = 0;           // ms timestamp
+let lastRefreshAttempt = 0;    // cooldown guard — prevents infinite retry loops
+const REFRESH_COOLDOWN_MS = 10_000;
 let scanAbortController = null;
 let downloadActive = false;
 
@@ -22,7 +34,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   switch (msg.action) {
     case 'storeToken':
-      handleStoreToken(msg.token);
+      handleStoreToken(msg.token, msg.apiBase);
       sendResponse({ ok: true });
       break;
 
@@ -67,7 +79,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
 // ── Token Helpers ─────────────────────────────────────────────────────────────
 
-function handleStoreToken(token) {
+function handleStoreToken(token, apiBase) {
   if (!token) return;
   currentToken = token;
   // Estimate expiry: Clerk JWTs expire in ~60s, be conservative
@@ -78,16 +90,24 @@ function handleStoreToken(token) {
   } catch {
     tokenExpiry = Date.now() + 55_000;
   }
-  chrome.storage.local.set({ cachedToken: token, tokenExpiry });
+
+  // Auto-discover the live API base from the intercepted request URL
+  if (apiBase && apiBase.includes('studio-api')) {
+    activeApiBase = apiBase;
+    console.log('[BG] API base auto-discovered from page:', activeApiBase);
+    chrome.storage.local.set({ cachedToken: token, tokenExpiry, apiBase });
+  } else {
+    chrome.storage.local.set({ cachedToken: token, tokenExpiry });
+  }
 }
 
 async function getValidToken() {
-  // Check in-memory first
+  // 1. Check in-memory first (fastest path — Strategy A intercept lands here)
   if (currentToken && Date.now() < tokenExpiry) {
     return currentToken;
   }
 
-  // Check storage
+  // 2. Check storage (survives service-worker restarts)
   const stored = await chrome.storage.local.get(['cachedToken', 'tokenExpiry']);
   if (stored.cachedToken && Date.now() < (stored.tokenExpiry || 0)) {
     currentToken = stored.cachedToken;
@@ -95,78 +115,154 @@ async function getValidToken() {
     return currentToken;
   }
 
-  // Fallback: try Clerk cookie flow
+  // 3. Cooldown guard — don't hammer Clerk if it keeps failing
+  if (Date.now() - lastRefreshAttempt < REFRESH_COOLDOWN_MS) {
+    throw new Error('No valid token. Browse any page on suno.com to capture your auth token automatically, or wait a moment and try Refresh Token.');
+  }
+
+  // 4. Fallback: try Clerk cookie flow
   return refreshTokenViaCookie();
 }
 
 async function refreshTokenViaCookie() {
   console.log('[BG] Attempting Clerk cookie token refresh...');
+  lastRefreshAttempt = Date.now();
 
-  // 1. Read __client cookie
-  let cookie;
-  try {
-    cookie = await chrome.cookies.get({ url: 'https://suno.com', name: '__client' });
-  } catch (e) {
-    throw new Error('Cannot read suno.com cookies — make sure you are logged in at suno.com');
+  // ── Step 1: Try __session on suno.com first ────────────────────────────────
+  // __session is a short-lived (~60s) JWT Clerk sets on the app domain.
+  // When present it's already a valid Bearer token — no exchange needed.
+  const sessionCookie = await chrome.cookies.get({ url: 'https://suno.com', name: '__session' }).catch(() => null);
+  if (sessionCookie?.value) {
+    console.log('[BG] Using __session cookie directly as token');
+    handleStoreToken(sessionCookie.value);
+    return sessionCookie.value;
   }
 
-  if (!cookie) {
-    throw new Error('No __client cookie found — please log in at suno.com');
+  // ── Step 2: Use __client on clerk.suno.com (the FAPI domain) ──────────────
+  // __client is long-lived and lives on clerk.suno.com, NOT on suno.com.
+  const clientCookie = await chrome.cookies.get({ url: 'https://clerk.suno.com', name: '__client' }).catch(() => null);
+
+  if (!clientCookie?.value) {
+    throw new Error('No Clerk cookies found — please log in at suno.com and browse a page so your token is captured automatically.');
   }
 
-  // 2. Parse the Clerk client object from the cookie value
-  //    The cookie value is a JWT. Decode the payload to find active session.
+  // ── Step 3: Parse __client JWT to extract active session ID ───────────────
   let sessionId;
   try {
-    const parts = cookie.value.split('.');
-    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/')));
-    console.log('[BG] Clerk client payload keys:', Object.keys(payload));
+    const payload = JSON.parse(
+      atob(clientCookie.value.split('.')[1].replace(/-/g, '+').replace(/_/g, '/'))
+    );
+    console.log('[BG] __client payload keys:', Object.keys(payload));
 
-    // The payload contains a `client` object with `sessions` array
-    const sessions = payload.client?.sessions || payload.sessions || [];
-    const activeSession = sessions.find(s => s.status === 'active') || sessions[0];
+    // Clerk encodes the session ID in `sid` or `sub` at the top level,
+    // OR inside a nested `client.sessions` array.
+    sessionId =
+      payload.sid ||
+      payload.sub ||
+      payload.client?.sessions?.find(s => s.status === 'active')?.id ||
+      payload.client?.sessions?.[0]?.id ||
+      payload.sessions?.find(s => s.status === 'active')?.id ||
+      payload.sessions?.[0]?.id;
 
-    if (!activeSession) throw new Error('No active Clerk session found in cookie');
-    sessionId = activeSession.id;
-    console.log('[BG] Found session ID:', sessionId);
+    if (!sessionId) throw new Error('Could not locate session ID in __client JWT');
+    console.log('[BG] Session ID:', sessionId);
   } catch (e) {
-    if (e.message.includes('session')) throw e;
     throw new Error('Failed to parse __client cookie: ' + e.message);
   }
 
-  // 3. Exchange session for JWT
+  // ── Step 4: Exchange session for a fresh JWT ───────────────────────────────
+  // Service workers cannot use `credentials: include`, so we forward the
+  // __client cookie value manually in the Cookie header.
   const url = `https://clerk.suno.com/v1/client/sessions/${sessionId}/tokens?__clerk_api_version=2021-02-05`;
   const resp = await fetch(url, {
     method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Cookie': `__client=${clientCookie.value}`,
+    },
   });
 
   if (!resp.ok) {
-    throw new Error(`Clerk token endpoint returned ${resp.status}`);
+    throw new Error(`Clerk token endpoint returned ${resp.status} — try reloading suno.com`);
   }
 
   const data = await resp.json();
   const jwt = data.jwt || data.token;
-  if (!jwt) throw new Error('Clerk response missing jwt field: ' + JSON.stringify(data));
+  if (!jwt) throw new Error('Clerk response missing jwt: ' + JSON.stringify(data));
 
   handleStoreToken(jwt);
   console.log('[BG] Token refreshed via Clerk cookie flow');
   return jwt;
 }
 
+// ── Suno API fetch helper ─────────────────────────────────────────────────────
+
+async function sunoApiFetch(path, token) {
+  const url = `${activeApiBase}${path}`;
+  console.log(`[BG] API fetch: ${url}`);
+
+  const resp = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Origin': 'https://suno.com',
+      'Referer': 'https://suno.com/',
+    },
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`HTTP ${resp.status}: ${text.substring(0, 200)}`);
+  }
+
+  return resp.json();
+}
+
+async function findWorkingApiBase(token) {
+  for (const base of API_DOMAINS) {
+    try {
+      console.log(`[BG] Trying API domain: ${base}`);
+      const resp = await fetch(`${base}/api/feed/v2?page=0`, {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Accept': 'application/json',
+          'Origin': 'https://suno.com',
+          'Referer': 'https://suno.com/',
+        },
+      });
+      if (resp.ok || resp.status === 401) {
+        // 401 = domain works but token bad; 200 = domain + token both good
+        console.log(`[BG] Working API domain: ${base} (${resp.status})`);
+        activeApiBase = base;
+        chrome.storage.local.set({ apiBase: base });
+        return base;
+      }
+      console.log(`[BG] Domain ${base} returned ${resp.status}`);
+    } catch (e) {
+      console.log(`[BG] Domain ${base} unreachable: ${e.message}`);
+    }
+  }
+  throw new Error('All API domains failed — check your connection');
+}
+
 // ── Status ────────────────────────────────────────────────────────────────────
 
 async function getStatus() {
-  const stored = await chrome.storage.local.get(['library', 'downloaded', 'cachedToken', 'tokenExpiry', 'username']);
+  const stored = await chrome.storage.local.get(['library', 'downloaded', 'cachedToken', 'tokenExpiry', 'username', 'apiBase']);
   const hasToken = !!(stored.cachedToken && Date.now() < (stored.tokenExpiry || 0));
 
-  // Try to get username from stored data or fetch it
-  let username = stored.username || null;
+  // Restore the last-known working API base
+  if (stored.apiBase) activeApiBase = stored.apiBase;
+
+  const username = stored.username || null;
 
   return {
     connected: hasToken,
     username,
+    apiBase: activeApiBase,
     libraryCount: (stored.library || []).length,
     downloadedCount: Object.keys(stored.downloaded || {}).length,
     downloadActive,
@@ -187,19 +283,35 @@ async function scanLibrary(sendResponse) {
   try {
     sendProgress('scan', { page: 0, found: 0, status: 'starting' });
 
+    // On the very first page, probe for the working API domain if needed
+    let domainVerified = false;
+
     while (!signal.aborted) {
       const token = await getValidToken();
-      const url = `https://studio-api.suno.ai/api/feed/v2?page=${page}`;
 
-      console.log(`[BG] Scanning page ${page}...`);
+      console.log(`[BG] Scanning page ${page} via ${activeApiBase}...`);
       sendProgress('scan', { page, found: allClips.length, status: 'scanning' });
 
       let data;
       try {
-        data = await fetchWithRetry(url, {
-          headers: { Authorization: `Bearer ${token}` },
-          signal,
-        });
+        if (!domainVerified) {
+          // First call — if it fails with 503 try fallback domains before giving up
+          try {
+            data = await sunoApiFetch(`/api/feed/v2?page=${page}`, token);
+            domainVerified = true;
+          } catch (e) {
+            if (e.message.includes('503') || e.message.includes('502')) {
+              console.warn(`[BG] ${activeApiBase} returned ${e.message} — trying fallback domains`);
+              await findWorkingApiBase(token);
+              data = await sunoApiFetch(`/api/feed/v2?page=${page}`, token);
+              domainVerified = true;
+            } else {
+              throw e;
+            }
+          }
+        } else {
+          data = await sunoApiFetch(`/api/feed/v2?page=${page}`, token);
+        }
       } catch (e) {
         if (e.name === 'AbortError') break;
         throw e;
@@ -383,44 +495,6 @@ function sanitizeFilename(title, clipId) {
   return shortId ? `${clean} [${shortId}].mp3` : `${clean}.mp3`;
 }
 
-async function fetchWithRetry(url, options = {}, maxRetries = 3) {
-  let lastError;
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    if (attempt > 0) {
-      await sleep(1000 * Math.pow(2, attempt - 1)); // exponential backoff
-    }
-    try {
-      const resp = await fetch(url, options);
-
-      if (resp.status === 401 || resp.status === 403) {
-        // Token expired — try refresh
-        console.log(`[BG] Got ${resp.status}, attempting token refresh...`);
-        try {
-          await refreshTokenViaCookie();
-        } catch {
-          // If cookie refresh fails, we'll try again next iteration
-        }
-        // Retry with fresh token on next iteration
-        if (options.headers) {
-          const newToken = await getValidToken();
-          options.headers.Authorization = `Bearer ${newToken}`;
-        }
-        continue;
-      }
-
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}: ${resp.statusText}`);
-      }
-
-      return resp.json();
-    } catch (e) {
-      if (e.name === 'AbortError') throw e;
-      lastError = e;
-      console.warn(`[BG] Fetch attempt ${attempt + 1} failed:`, e.message);
-    }
-  }
-  throw lastError || new Error('Max retries exceeded');
-}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));

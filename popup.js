@@ -49,7 +49,7 @@ function applyStatus(status) {
   updateBadge(status.connected);
 
   if (!status.connected) {
-    setStatus('Visit suno.com and log in, then click Refresh.');
+    setStatus('Browse any page on suno.com — your token is captured automatically. Or click Refresh Token below.');
     showPanel('disconnected');
     return;
   }
@@ -124,10 +124,10 @@ async function handleRefreshToken() {
     log('Token refreshed successfully', 'success');
     await loadStatus();
   } catch (e) {
-    setStatus('Token refresh failed: ' + e.message);
-    log('Token refresh failed: ' + e.message, 'error');
-    // Still try to reload status in case content script already got a token
-    await loadStatus();
+    setStatus('Refresh failed: ' + e.message);
+    log('Refresh failed: ' + e.message, 'error');
+    // Don't call loadStatus() here — it re-shows the same disconnected panel
+    // and can feel like a loop. Let the user decide what to do next.
   }
 }
 

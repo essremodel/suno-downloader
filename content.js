@@ -20,6 +20,7 @@
     chrome.runtime.sendMessage({
       action: 'storeToken',
       token: token.replace('Bearer ', ''),
+      apiBase: event.data.apiBase || null,
     }).catch(() => {}); // popup may not be open
   });
 

@@ -3,8 +3,9 @@
  * No inline script injection needed, so Suno's CSP is not violated.
  *
  * Monkey-patches fetch and XHR to capture Authorization headers sent to
- * studio-api.suno.ai / clerk.suno.com, then posts them to the content script
- * via window.postMessage.
+ * studio-api.prod.suno.com / clerk.suno.com, then posts them to the content
+ * script via window.postMessage. Also relays the origin so background.js
+ * can auto-discover the live API base domain.
  */
 
 (function () {
@@ -21,7 +22,8 @@
         : '';
 
     if (
-      url.includes('studio-api.suno.ai') ||
+      url.includes('studio-api.prod.suno.com') ||
+      url.includes('studio-api.suno.ai') ||   // legacy fallback — intercept either domain
       url.includes('clerk.suno.com')
     ) {
       const headers =
@@ -37,8 +39,10 @@
       }
 
       if (auth) {
+        let apiBase = null;
+        try { apiBase = new URL(url).origin; } catch {}
         window.postMessage(
-          { type: '__SUNO_AUTH_TOKEN__', token: auth, url },
+          { type: '__SUNO_AUTH_TOKEN__', token: auth, url, apiBase },
           '*'
         );
       }
@@ -60,7 +64,8 @@
     if (
       name.toLowerCase() === 'authorization' &&
       this._sunoUrl &&
-      (this._sunoUrl.includes('studio-api.suno.ai') ||
+      (this._sunoUrl.includes('studio-api.prod.suno.com') ||
+        this._sunoUrl.includes('studio-api.suno.ai') ||
         this._sunoUrl.includes('clerk.suno.com'))
     ) {
       window.postMessage(
