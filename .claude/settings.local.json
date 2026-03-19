@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(wc:*)",
+      "Bash(cat \"/Users/bradbanks/Documents/GitHub-ESS/suno-downloader/suno.com \\(1\\).har\")",
+      "Bash(python3:*)"
+    ]
+  }
+}

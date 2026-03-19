@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Suno Downloader</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <!-- Header -->
+  <header>
+    <div class="logo">
+      <svg width="20" height="20" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="10" cy="10" r="10" fill="#f97316"/>
+        <path d="M13 6v5.5a2.5 2.5 0 1 1-1-2V7.5l-4 .8V13a2.5 2.5 0 1 1-1-2V6.4L13 6z" fill="white"/>
+      </svg>
+      <span class="logo-text">Suno Downloader</span>
+    </div>
+    <div id="connection-badge" class="badge badge-disconnected">Not connected</div>
+  </header>
+
+  <!-- Status bar -->
+  <div id="status-bar" class="status-bar">
+    <span id="status-text">Visit suno.com and log in, then click Refresh.</span>
+  </div>
+
+  <!-- Not connected state -->
+  <div id="panel-disconnected" class="panel">
+    <div class="empty-state">
+      <div class="empty-icon">🎵</div>
+      <p>Open <strong>suno.com</strong> in a tab, log in to your account, then click Refresh below.</p>
+    </div>
+    <button id="btn-refresh-token" class="btn btn-primary btn-full">
+      Refresh Connection
+    </button>
+  </div>
+
+  <!-- Connected state (pre-scan) -->
+  <div id="panel-connected" class="panel hidden">
+    <div class="info-row">
+      <span class="label">Account</span>
+      <span id="username-display" class="value">—</span>
+    </div>
+    <div class="info-row">
+      <span class="label">Library</span>
+      <span id="library-count-display" class="value">Not scanned yet</span>
+    </div>
+
+    <div class="btn-group">
+      <button id="btn-scan" class="btn btn-primary btn-full">
+        Scan Library
+      </button>
+      <button id="btn-refresh-token-2" class="btn btn-ghost btn-full">
+        Refresh Token
+      </button>
+    </div>
+  </div>
+
+  <!-- Scanning state -->
+  <div id="panel-scanning" class="panel hidden">
+    <div class="scan-info">
+      <div id="scan-status-text" class="scan-status">Scanning page 0…</div>
+      <div id="scan-count" class="scan-count">Found 0 songs</div>
+    </div>
+    <div class="progress-bar">
+      <div id="scan-progress-fill" class="progress-fill indeterminate"></div>
+    </div>
+    <button id="btn-cancel-scan" class="btn btn-ghost btn-full mt-8">Cancel</button>
+  </div>
+
+  <!-- Library panel -->
+  <div id="panel-library" class="panel hidden">
+    <div class="library-header">
+      <div class="library-meta">
+        <span id="total-count" class="total-count">0 songs</span>
+        <span id="selected-count" class="selected-count">0 selected</span>
+      </div>
+      <div class="library-actions">
+        <button id="btn-select-all" class="btn btn-tiny">All</button>
+        <button id="btn-deselect-all" class="btn btn-tiny">None</button>
+        <button id="btn-rescan" class="btn btn-tiny">Rescan</button>
+      </div>
+    </div>
+
+    <div class="search-row">
+      <input type="text" id="search-input" class="search-input" placeholder="Filter songs…" />
+    </div>
+
+    <div id="song-list" class="song-list"></div>
+
+    <div class="download-actions">
+      <button id="btn-download-selected" class="btn btn-primary btn-full">
+        Download Selected MP3s
+      </button>
+      <button id="btn-export-csv" class="btn btn-ghost btn-full mt-4">
+        Export Library as CSV
+      </button>
+    </div>
+  </div>
+
+  <!-- Downloading state -->
+  <div id="panel-downloading" class="panel hidden">
+    <div class="dl-stats">
+      <span id="dl-count" class="dl-count">0 / 0</span>
+      <span id="dl-pct" class="dl-pct">0%</span>
+    </div>
+    <div class="progress-bar">
+      <div id="dl-progress-fill" class="progress-fill" style="width: 0%"></div>
+    </div>
+    <div id="dl-current" class="dl-current">Starting…</div>
+    <div id="dl-failed" class="dl-failed hidden">0 failed</div>
+  </div>
+
+  <!-- Log area (always visible when has content) -->
+  <div id="log-area" class="log-area hidden">
+    <div id="log-content"></div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
