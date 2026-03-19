@@ -41,7 +41,8 @@
     "downloads",
     "storage",
     "scripting",
-    "activeTab"
+    "activeTab",
+    "offscreen"
   ],
   "host_permissions": [
     "*://suno.com/*",

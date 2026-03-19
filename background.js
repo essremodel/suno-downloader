@@ -443,6 +443,12 @@ async function startDownloads(clipIds, sendResponse) {
 
   sendProgress('download', { completed, failed, total, status: 'starting' });
 
+  // Pre-warm the offscreen document before the queue starts so the first
+  // download doesn't pay the creation cost mid-flight.
+  try { await ensureOffscreenDocument(); } catch (e) {
+    console.warn('[BG] Could not create offscreen document:', e.message);
+  }
+
   try {
     await downloadQueue(clips, 2, async (clip, success, error) => {
       if (success) {
@@ -492,63 +498,86 @@ async function downloadQueue(clips, maxConcurrent, onResult) {
 async function downloadSongWithMetadata(clip) {
   const title  = clip.title || 'Untitled';
   const songId = clip.id;
-  console.log(`[BG] Fetching MP3 + art: "${title}"`);
+  const filename = `Suno Downloads/${sanitizeFilename(title, songId)}`;
 
-  // 1. Fetch the raw MP3
-  const audioUrl = clip.audio_url || `https://cdn1.suno.ai/${songId}.mp3`;
-  const mp3Resp  = await fetch(audioUrl);
-  if (!mp3Resp.ok) throw new Error(`MP3 fetch failed: HTTP ${mp3Resp.status}`);
-  const mp3Data  = await mp3Resp.arrayBuffer();
+  console.log(`[BG] Downloading: "${title}" (${songId})`);
 
-  // 2. Fetch cover art — try image_large_url → image_url → constructed URL
-  let coverArt      = null;
-  let coverMimeType = 'image/jpeg';
-  const imageUrls   = [
-    clip.image_large_url,
-    clip.image_url,
-    `https://cdn2.suno.ai/image_${songId}.jpeg`,
-  ].filter(Boolean);
+  try {
+    // 1. Fetch the raw MP3
+    const audioUrl = clip.audio_url || `https://cdn1.suno.ai/${songId}.mp3`;
+    console.log(`[BG]   MP3: ${audioUrl}`);
+    const mp3Resp = await fetch(audioUrl);
+    if (!mp3Resp.ok) throw new Error(`MP3 fetch HTTP ${mp3Resp.status}`);
+    const mp3Data = await mp3Resp.arrayBuffer();
+    console.log(`[BG]   MP3 size: ${(mp3Data.byteLength / 1024 / 1024).toFixed(1)} MB`);
 
-  for (const imgUrl of imageUrls) {
-    try {
-      const imgResp = await fetch(imgUrl);
-      if (imgResp.ok) {
-        coverArt      = await imgResp.arrayBuffer();
-        coverMimeType = imgResp.headers.get('content-type')?.split(';')[0] || 'image/jpeg';
-        console.log(`[BG] Cover art: ${Math.round(coverArt.byteLength / 1024)}KB from ${imgUrl}`);
-        break;
-      }
-    } catch { /* try next URL */ }
+    // 2. Fetch cover art — try image_large_url → image_url → constructed URL
+    let coverArt = null, coverMimeType = 'image/jpeg';
+    const imageUrls = [
+      clip.image_large_url,
+      clip.image_url,
+      `https://cdn2.suno.ai/image_${songId}.jpeg`,
+    ].filter(Boolean);
+    for (const imgUrl of imageUrls) {
+      try {
+        const r = await fetch(imgUrl);
+        if (r.ok) {
+          coverArt      = await r.arrayBuffer();
+          coverMimeType = r.headers.get('content-type')?.split(';')[0] || 'image/jpeg';
+          console.log(`[BG]   Art: ${Math.round(coverArt.byteLength / 1024)} KB`);
+          break;
+        }
+      } catch { /* try next */ }
+    }
+    if (!coverArt) console.log('[BG]   No cover art — APIC frame omitted');
+
+    // 3. Build ID3 metadata
+    const tags = (clip.metadata?.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+    const meta = {
+      title,
+      artist:        clip.display_name || 'Suno AI',
+      album:         `Suno - ${clip.display_name || 'AI Music'}`,
+      genre:         tags[0] || '',
+      year:          clip.created_at ? String(new Date(clip.created_at).getFullYear()) : '',
+      comment:       `Suno ID: ${songId}`,
+      lyrics:        clip.metadata?.prompt || '',
+      coverArt,
+      coverMimeType,
+    };
+
+    // 4. Build tagged MP3 → convert to Uint8Array for message passing
+    const taggedBlob   = createTaggedMp3(mp3Data, meta);
+    const taggedBuffer = await taggedBlob.arrayBuffer();
+    console.log(`[BG]   Tagged size: ${(taggedBuffer.byteLength / 1024 / 1024).toFixed(1)} MB`);
+
+    // 5. Get a blob URL from the offscreen document (service workers lack URL.createObjectURL)
+    const blobUrl = await createBlobUrlViaOffscreen(new Uint8Array(taggedBuffer));
+    console.log(`[BG]   Blob URL ready — starting download`);
+
+    // 6. Hand off to chrome.downloads, revoke when done
+    return await startChromeDownload(blobUrl, filename, /* revoke */ true);
+
+  } catch (err) {
+    // Fallback: skip ID3 embedding and download the raw CDN file
+    console.warn(`[BG]   ID3 tagging failed (${err.message}) — falling back to direct CDN download`);
+    console.warn(`[BG]   Stack: ${err.stack}`);
+    const audioUrl = clip.audio_url || `https://cdn1.suno.ai/${songId}.mp3`;
+    return startChromeDownload(audioUrl, filename, /* revoke */ false);
   }
-  if (!coverArt) console.log('[BG] No cover art found — embedding without APIC frame');
+}
 
-  // 3. Assemble metadata
-  const tags = (clip.metadata?.tags || '')
-    .split(',').map(t => t.trim()).filter(Boolean);
-  const meta = {
-    title,
-    artist:        clip.display_name || 'Suno AI',
-    album:         `Suno - ${clip.display_name || 'AI Music'}`,
-    genre:         tags[0] || '',
-    year:          clip.created_at ? String(new Date(clip.created_at).getFullYear()) : '',
-    comment:       `Suno ID: ${songId}`,
-    lyrics:        clip.metadata?.prompt || '',
-    coverArt,
-    coverMimeType,
-  };
-
-  // 4. Embed ID3 tags and wrap in a Blob
-  const taggedBlob = createTaggedMp3(mp3Data, meta);
-  const blobUrl    = URL.createObjectURL(taggedBlob);
-  const filename   = `Suno Downloads/${sanitizeFilename(title, songId)}`;
-
-  // 5. Hand off to chrome.downloads — revoke the blob URL after completion
+/**
+ * Wraps chrome.downloads.download in a promise.
+ * If revoke=true the url is treated as a blob URL and sent to the offscreen
+ * document for revocation once the download completes.
+ */
+function startChromeDownload(url, filename, revoke) {
   return new Promise((resolve, reject) => {
     chrome.downloads.download(
-      { url: blobUrl, filename, conflictAction: 'uniquify', saveAs: false },
+      { url, filename, conflictAction: 'uniquify', saveAs: false },
       (downloadId) => {
         if (chrome.runtime.lastError) {
-          URL.revokeObjectURL(blobUrl);
+          if (revoke) revokeBlobUrl(url);
           reject(new Error(chrome.runtime.lastError.message));
           return;
         }
@@ -556,27 +585,80 @@ async function downloadSongWithMetadata(clip) {
         const listener = (delta) => {
           if (delta.id !== downloadId) return;
           if (delta.state?.current === 'complete') {
-            URL.revokeObjectURL(blobUrl);
+            if (revoke) revokeBlobUrl(url);
             chrome.downloads.onChanged.removeListener(listener);
             resolve(downloadId);
           } else if (delta.state?.current === 'interrupted') {
-            URL.revokeObjectURL(blobUrl);
+            if (revoke) revokeBlobUrl(url);
             chrome.downloads.onChanged.removeListener(listener);
             reject(new Error(`Download interrupted: ${delta.error?.current || 'unknown'}`));
           }
         };
-
         chrome.downloads.onChanged.addListener(listener);
 
-        // Timeout guard (5 min) — revoke blob so it doesn't linger
+        // 5-minute safety timeout
         setTimeout(() => {
-          URL.revokeObjectURL(blobUrl);
+          if (revoke) revokeBlobUrl(url);
           chrome.downloads.onChanged.removeListener(listener);
           resolve(downloadId);
         }, 300_000);
       }
     );
   });
+}
+
+// ── Offscreen document management ────────────────────────────────────────────
+// MV3 service workers have no URL.createObjectURL. We use an offscreen document
+// (which has full DOM access) to create blob URLs, then pass them back here.
+
+let _offscreenCreating = null;
+
+async function ensureOffscreenDocument() {
+  const offscreenUrl = chrome.runtime.getURL('offscreen.html');
+  const existing = await chrome.runtime.getContexts({
+    contextTypes: ['OFFSCREEN_DOCUMENT'],
+    documentUrls: [offscreenUrl],
+  });
+  if (existing.length > 0) return;
+
+  if (_offscreenCreating) { await _offscreenCreating; return; }
+
+  _offscreenCreating = chrome.offscreen.createDocument({
+    url: 'offscreen.html',
+    reasons: ['BLOBS'],
+    justification: 'Create blob URLs for MP3 files with embedded ID3 metadata',
+  });
+  await _offscreenCreating;
+  _offscreenCreating = null;
+}
+
+// Encode Uint8Array → base64 in chunks to avoid stack overflow on large files
+function uint8ArrayToBase64(bytes) {
+  let binary = '';
+  const chunkSize = 8192;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return btoa(binary);
+}
+
+async function createBlobUrlViaOffscreen(uint8Array, mimeType = 'audio/mpeg') {
+  await ensureOffscreenDocument();
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { action: 'createBlobUrl', base64: uint8ArrayToBase64(uint8Array), mimeType },
+      (resp) => {
+        if (chrome.runtime.lastError) return reject(new Error(chrome.runtime.lastError.message));
+        if (resp?.error)              return reject(new Error(resp.error));
+        resolve(resp.url);
+      }
+    );
+  });
+}
+
+function revokeBlobUrl(url) {
+  // Fire-and-forget — if offscreen is already gone that's fine
+  chrome.runtime.sendMessage({ action: 'revokeBlobUrl', url }).catch(() => {});
 }
 
 // ── Progress Broadcast ────────────────────────────────────────────────────────
