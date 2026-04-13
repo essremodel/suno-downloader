@@ -54,7 +54,7 @@ function applyStatus(status) {
     return;
   }
 
-  $('username-display').textContent = status.username || 'essremodel';
+  $('username-display').textContent = status.username || '(not connected)';
 
   // Show resume button if a partial scan exists
   const hasPartial = status.libraryCount > 0 && !status.scanComplete;

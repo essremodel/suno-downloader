@@ -1,0 +1,6 @@
+.env
+.env.local
+*.har
+node_modules/
+dist/
+.claude/
