@@ -1,139 +1,138 @@
+<div align="center">
+  <img src="./assets/hero.png" alt="Suno Library Downloader — Your Suno library. Saved as MP3. Orange audio waveform flowing into a download tray." width="100%">
+
 # Suno Library Downloader
 
-A Chrome extension (Manifest V3) that bulk-downloads your entire [Suno.ai](https://suno.com) library as MP3 files — no login credentials stored, no third-party servers, everything stays local.
+Bulk-download songs from your Suno library as MP3 files, with metadata and cover art when available.
 
----
+[![JavaScript](https://img.shields.io/badge/JavaScript-vanilla-f7df1e?style=flat&logo=javascript&logoColor=f7df1e&labelColor=202020)](./background.js) [![Manifest V3](https://img.shields.io/badge/Chrome-Manifest_V3-f97316?style=flat&labelColor=202020)](./manifest.json) [![No build step](https://img.shields.io/badge/build_step-none-aaaaaa?style=flat&labelColor=202020)](#install)
+
+[Install](#install) · [Usage](#usage) · [Privacy & permissions](#privacy--permissions) · [Troubleshooting](#troubleshooting) · [Contributing](./CONTRIBUTING.md)
+
+</div>
+
+A Chrome extension for keeping local copies of music from your own Suno account. Scan your library, choose tracks, and save MP3s to your Downloads folder. Export the scanned library as CSV to keep a searchable record of titles, prompts, tags, and audio URLs.
+
+The extension runs in your browser and uses your existing Suno session. There is no package installation or build step.
 
 ## Features
 
-- **Bulk download** — fetch every song in your library in one click
-- **Selective download** — check/uncheck individual songs before downloading
-- **Search & filter** — instantly filter your library by title
-- **Resume-aware** — already-downloaded songs are marked with ✓ so you only grab new ones
-- **CSV export** — save your full library metadata (title, duration, model version, tags, prompt, CDN URL) as a spreadsheet
-- **Concurrency control** — 3 parallel downloads with automatic rate limiting
-- **Token auto-refresh** — Clerk JWTs are refreshed transparently mid-scan so large libraries never stall
-- **No dependencies** — pure vanilla JS, no npm, no build step
+- **Download in bulk or by selection.** Filter songs by title and choose individual tracks.
+- **Embed metadata.** Add title, artist, album, genre, year, prompt/lyrics, and cover art to MP3s when available. If the tagged-download path fails, the extension attempts a direct audio download.
+- **Keep scan progress.** Save each page locally and offer a resume control for incomplete scans.
+- **See download history.** Mark previously downloaded songs in the list; selection remains under your control.
+- **Export a library inventory.** Save IDs, titles, durations, models, creation dates, tags, prompts, and audio URLs as CSV.
+- **Pace requests.** Scan with a 1.5-second delay between pages, retry rate-limited requests, and process two downloads concurrently.
 
----
+## Install
 
-## Installation
+```bash
+git clone https://github.com/essremodel/suno-downloader.git
+```
 
-> The extension is not on the Chrome Web Store. Load it unpacked in Developer Mode.
+You need Chrome and a signed-in Suno account. Git is optional: you can also use this repository's **Code → Download ZIP** menu and extract the archive.
 
-1. Clone or download this repository
-   ```
-   git clone https://github.com/essremodel/suno-downloader.git
-   ```
-2. Open Chrome and go to `chrome://extensions`
-3. Enable **Developer mode** (toggle in the top-right corner)
-4. Click **Load unpacked** and select the `suno-downloader` folder
-5. The orange music-note icon will appear in your toolbar
+1. Open `chrome://extensions` in Chrome.
+2. Turn on **Developer mode**.
+3. Choose **Load unpacked** and select the folder containing `manifest.json`.
+4. Pin **Suno Library Downloader** from Chrome's extensions menu.
+5. Open or reload [suno.com](https://suno.com) after loading the extension, then sign in.
 
----
+This repository provides an unpacked extension. No Chrome Web Store installation is required.
 
 ## Usage
 
-### 1. Connect
+<img src="./assets/popup-disconnected.png" alt="Actual extension popup before connecting, showing Not connected and the Refresh Connection button." width="380">
 
-- Open **suno.com** in any tab and make sure you are logged in
-- Browse around for a moment — the extension silently intercepts the auth token from the first API call the page makes
-- Click the extension icon. The badge should turn green: **Connected**
-- If it shows "Not connected", click **Refresh Connection** to trigger the fallback cookie-based token flow
+*The extension loaded in a fresh browser profile, before connecting to Suno.*
 
-### 2. Scan your library
+### Connect → scan → save
 
-- Click **Scan Library**
-- The extension paginates through your full song feed (~20 songs per page, 500 ms between requests)
-- Progress is shown live: `Scanning page 4… Found 73 songs`
+1. Browse a page on Suno so the extension can capture your session's authentication token.
+2. Open the extension. If it says **Not connected**, choose **Refresh Connection**. If needed, reload Suno and reopen the popup.
+3. Choose **Scan Library** and wait for the song list.
+4. Review the selected count, then choose **Download N MP3s**. To check one file first, **Test Download (1 Song)** downloads the first song in the scanned library.
 
-### 3. Download
+MP3s are saved under `Suno Downloads/` inside Chrome's configured download directory:
 
-- Once scanning completes your song list loads with all songs selected by default
-- Use the **search bar** to filter, or **All / None** to toggle selection
-- Click **Download N MP3s**
-- Files are saved to your default Downloads folder under `Suno Downloads/`
-- Filenames follow the pattern: `Song Title [clipId8].mp3`
-
-### 4. Export metadata (optional)
-
-- Click **Export Library as CSV** to save a spreadsheet of your full library including titles, durations, model versions, tags, prompts, and direct CDN URLs
-
----
-
-## How It Works
-
-### Authentication
-
-Suno uses [Clerk](https://clerk.com) for auth. The extension uses two complementary strategies:
-
-**Strategy A (primary)** — `injected.js` runs in the page's MAIN world and patches `window.fetch` and `XMLHttpRequest.prototype.setRequestHeader`. The moment the Suno page makes any authenticated API call, the `Authorization: Bearer <jwt>` header is captured and passed to the background service worker via `postMessage`. This avoids storing credentials and always gives a fresh, valid token.
-
-**Strategy B (fallback)** — If no token has been captured yet (e.g. the popup is opened before any page activity), the background worker reads the `__client` cookie Clerk stores on `suno.com`, parses the session ID from the JWT payload, and exchanges it at `https://clerk.suno.com/v1/client/sessions/{id}/tokens` for a short-lived JWT. Tokens are refreshed automatically before expiry (~55 s buffer).
-
-### API
-
-All API calls are made from the background service worker, which is not subject to CORS restrictions.
-
-| Purpose | Endpoint |
-|---|---|
-| List songs (paginated) | `GET https://studio-api.suno.ai/api/feed/v2?page={n}` |
-| Download audio | `https://cdn1.suno.ai/{clip_id}.mp3` |
-| Token refresh | `POST https://clerk.suno.com/v1/client/sessions/{id}/tokens` |
-
-### File Structure
-
-```
-suno-downloader/
-├── manifest.json      MV3 manifest — permissions, host_permissions, content scripts
-├── background.js      Service worker: token management, library scan, download queue
-├── injected.js        Runs in page MAIN world — patches fetch/XHR to capture tokens
-├── content.js         Isolated world bridge — relays postMessage tokens to background
-├── popup.html         Extension popup markup
-├── popup.js           Popup UI controller — all state transitions and user interactions
-├── popup.css          Dark theme UI (matches Suno's aesthetic)
-└── icons/             PNG icons at 16 × 16, 48 × 48, 128 × 128
+```text
+Suno Downloads/
+└── Song Title [clipId8].mp3
 ```
 
----
+The suffix is the first eight characters of the song ID. Invalid filename characters are replaced, and Chrome gives repeated filenames a unique name.
 
-## Permissions
+### Choose exactly what to download
 
-| Permission | Why it's needed |
-|---|---|
-| `cookies` | Read the Clerk `__client` cookie for fallback token refresh |
-| `downloads` | Save MP3 files to disk via `chrome.downloads.download()` |
-| `storage` | Cache the library manifest and download history locally |
-| `scripting` | Reserved for future use |
-| `activeTab` | Identify the active suno.com tab |
-| Host: `suno.com` | Content scripts and cookie access |
-| Host: `studio-api.suno.ai` | Fetch the paginated song feed |
-| Host: `cdn1/2.suno.ai` | Download MP3 audio files |
-| Host: `clerk.suno.com` | Exchange Clerk session for JWT |
+All songs are selected when the library loads, including previously downloaded songs. A checkmark records download history; it does **not** prevent another download.
 
-No data is sent to any external server. Everything runs locally in the extension.
+Searching only changes which rows are visible. It does **not** clear selections outside the filter. To download just the search results, enter a search and choose **All**, which replaces the selection with the visible songs. **None** clears the entire selection.
 
----
+### Export or continue later
+
+- Choose **Export Library as CSV** to export the entire cached library, regardless of search or selection. The file is named `Suno Library YYYY-MM-DD.csv`.
+- An incomplete scan can expose **Resume Scan** or an inline resume link when you reopen the popup. If the resulting library appears incomplete, run **Rescan** from the beginning.
+- Change the download location in `chrome://settings/downloads`. There is no separate configuration file or settings panel.
+
+## Privacy & permissions
+
+The extension does not ask you to enter a password. It captures bearer tokens from Suno page requests and **caches the token and expiry in `chrome.storage.local`**, together with the API base, scanned library, scan progress, and download history. These are sensitive local browser data.
+
+The cookie fallback first tries Suno's `__session` cookie, then attempts a Clerk session-token exchange using `__client` on `clerk.suno.com`. Refresh can fail; browsing Suno again may be necessary.
+
+The code contacts Suno's API, Clerk, and audio/artwork URLs to scan and download. It contains no separate analytics or developer-operated upload service. This is a networked tool, not an offline-only application.
+
+| Declared permission | Purpose in this repository |
+| --- | --- |
+| `cookies` | Read session cookies for the fallback authentication flow |
+| `downloads` | Save MP3 and CSV files through Chrome |
+| `storage` | Cache authentication, library data, and download history locally |
+| `offscreen` | Create blob URLs for MP3s with embedded metadata |
+| `scripting`, `activeTab` | Declared in the manifest; not currently used by the implementation |
+| Suno page hosts | Run the content scripts on `suno.com` and `www.suno.com` |
+| `studio-api.prod.suno.com` | Request the paginated library feed |
+| `cdn1.suno.ai`, `cdn2.suno.ai` | Retrieve audio and cover art |
+| `clerk.suno.com` | Attempt authentication-token refresh |
+
+See [manifest.json](./manifest.json) for the exact permission list and [background.js](./background.js) for storage and network behavior. Do not include tokens, cookies, HAR captures, or private library exports in public issues.
+
+## Limitations
+
+- **Suno integration can change.** Authentication and the feed endpoint depend on Suno's web behavior. This repository does not guarantee compatibility with future changes.
+- **Scan resume is best effort.** The popup resumes after the stored page number. After a failed page, use a full rescan if tracks are missing.
+- **Verify saved files.** Download-history markers are a convenience, not an integrity check. The current download wrapper treats a five-minute timeout as completion.
+- **Metadata is best effort.** Artwork may be unavailable; a fallback download can lack the metadata added by this extension. Prompt/lyrics tags are truncated to 5,000 characters.
+- **Cache follows the browser profile.** Library and download history are not separated by Suno account. Rescan after changing accounts and review the selected tracks.
+
+Use this tool for content you own or have permission to download. It is an independent project, not an official Suno product.
 
 ## Troubleshooting
 
-**"Not connected" after loading**
-Visit suno.com, make sure you are logged in, then click **Refresh Connection** in the popup. If that fails, open the browser console on suno.com and look for `[Suno Downloader] Intercepted auth token` — if it never appears, reload the tab with the extension installed.
+| Symptom | What to try |
+| --- | --- |
+| **Not connected** | Reload Suno while signed in, browse a page, then reopen the popup or use **Refresh Connection**. |
+| **Scan pauses or fails** | Wait for any retry countdown. Refresh your session, reopen the popup, and resume if offered. Use **Rescan** if the inventory looks incomplete. |
+| **MP3 fails or artwork is missing** | Try **Test Download (1 Song)** and inspect the service-worker log for the HTTP or download error. Check whether the track still plays on Suno. |
+| **Files are in an unexpected folder** | Check `chrome://settings/downloads` and Chrome's download history. |
+| **Old extension behavior after an update** | Click the extension's reload button in `chrome://extensions`, then reload your Suno tab. |
 
-**Scan stops early or returns 0 songs**
-Your token may have expired mid-scan. The extension retries automatically, but if the Clerk cookie is also stale you will need to log out and back into suno.com.
+For diagnostics, open `chrome://extensions`, find the extension, and inspect its **service worker**. Background messages use the `[BG]` prefix. Right-click the popup and choose **Inspect** for popup errors. Review logs for private information before sharing.
 
-**Some songs show as failed (403)**
-Suno occasionally expires CDN URLs for deleted or private clips. These are logged and skipped automatically.
+## Development
 
-**Downloads not appearing in the expected folder**
-Chrome saves to your default Downloads directory. Check Chrome's download settings at `chrome://settings/downloads` to confirm or change the location.
+The JavaScript, HTML, and CSS run directly as an unpacked extension. There is no dependency manifest, automated test suite, CI workflow, or build pipeline in this repository.
 
-**Debugging**
-Open `chrome://extensions` → find Suno Library Downloader → click **Service Worker** to open the background console. All background events are prefixed `[BG]`. Popup errors appear in the popup's DevTools (right-click the popup → Inspect).
+| File | Responsibility |
+| --- | --- |
+| [manifest.json](./manifest.json) | Extension metadata, permissions, and entry points |
+| [background.js](./background.js) | Authentication, scanning, download queue, and file saving |
+| [injected.js](./injected.js) / [content.js](./content.js) | Capture page request tokens and relay them to the worker |
+| [id3-writer.js](./id3-writer.js) | Build MP3 metadata tags |
+| [offscreen.html](./offscreen.html) / [offscreen.js](./offscreen.js) | Create and revoke blob URLs |
+| [popup.html](./popup.html) / [popup.js](./popup.js) / [popup.css](./popup.css) | Popup interface, controls, and styling |
 
----
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for local checks and a manual verification checklist.
 
-## Disclaimer
+## License status
 
-This extension is a personal tool for downloading your own AI-generated music from your own Suno account. It does not circumvent DRM, access other users' content, or violate Suno's public API in any way that is not already accessible through the normal web interface. Use responsibly and in accordance with [Suno's Terms of Service](https://suno.com/terms).
+No license file is currently included in this repository. No open-source license is declared.
